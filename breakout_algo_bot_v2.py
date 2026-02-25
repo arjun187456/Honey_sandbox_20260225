@@ -66,6 +66,11 @@ TRADING_START_TIME = dt_time(10, 0, 0)  # Strict 10 AM gate
 NEW_ORDER_CUTOFF = MARKET_CLOSE  # Stop new trades at market close (15:30)
 SLIPPAGE_BUFFER = 0.0005  # 0.05% buffer for order execution
 
+# 2-second live noise filters (for safer real-time execution)
+BREAKOUT_CONFIRM_TICKS = 5        # 5 ticks * 2s ≈ 10s confirmation
+MIN_BREAKOUT_EXCESS = 0.0015      # Require 0.15% breakout excess over history high
+COOLDOWN_AFTER_SL_SECONDS = 60    # Pause entries after SL to reduce whipsaws
+
 # Runtime flags (can be set from CLI)
 FORCE_ENTRY = None  # 'CALL' or 'PUT' to force a test entry
 CLOSE_OPEN = False  # If True, close any open positions at start
@@ -180,6 +185,13 @@ class TradingState:
         
         self.sync_complete = False
         self.trading_started = False
+
+        # 2-second debounce / noise-control state
+        self.breakout_confirm_count = {'CALL': 0, 'PUT': 0}
+        self.last_sl_hit_time = None
+
+    def reset_breakout_confirms(self):
+        self.breakout_confirm_count = {'CALL': 0, 'PUT': 0}
         
     def add_trade(self, trade):
         self.active_trades.append(trade)
@@ -536,6 +548,14 @@ def check_breakout_signal(chain, spot):
     if not state.sync_complete:
         return None
 
+    # Cooldown after SL to avoid immediate re-entry in chop
+    now = datetime.now(TZ)
+    if state.last_sl_hit_time:
+        elapsed = (now - state.last_sl_hit_time).total_seconds()
+        if elapsed < COOLDOWN_AFTER_SL_SECONDS:
+            state.reset_breakout_confirms()
+            return None
+
     
     call_option, put_option = find_atm_options(spot, chain)
     
@@ -545,17 +565,34 @@ def check_breakout_signal(chain, spot):
     call_ltp = get_option_ltp(call_option)
     put_ltp = get_option_ltp(put_option)
     
-    # Check for CALL breakout
-    if state.history_high_call and call_ltp > state.history_high_call * 1.001:
+    call_trigger = state.history_high_call * (1 + MIN_BREAKOUT_EXCESS) if state.history_high_call else None
+    put_trigger = state.history_high_put * (1 + MIN_BREAKOUT_EXCESS) if state.history_high_put else None
+
+    # CALL confirmation logic
+    if call_trigger and call_ltp > call_trigger:
+        state.breakout_confirm_count['CALL'] += 1
+    else:
+        state.breakout_confirm_count['CALL'] = 0
+
+    # PUT confirmation logic
+    if put_trigger and put_ltp > put_trigger:
+        state.breakout_confirm_count['PUT'] += 1
+    else:
+        state.breakout_confirm_count['PUT'] = 0
+
+    if state.breakout_confirm_count['CALL'] >= BREAKOUT_CONFIRM_TICKS:
+        state.breakout_confirm_count['CALL'] = 0
+        state.breakout_confirm_count['PUT'] = 0
         return {
             'type': 'CALL',
             'strike': call_option['strike'],
             'entry_price': call_ltp,
             'option_data': call_option
         }
-    
-    # Check for PUT breakout
-    if state.history_high_put and put_ltp > state.history_high_put * 1.001:
+
+    if state.breakout_confirm_count['PUT'] >= BREAKOUT_CONFIRM_TICKS:
+        state.breakout_confirm_count['CALL'] = 0
+        state.breakout_confirm_count['PUT'] = 0
         return {
             'type': 'PUT',
             'strike': put_option['strike'],
@@ -803,6 +840,10 @@ def update_positions(chain, spot, current_time):
     # Close trades and execute reversals
     for trade_id, exit_price, reason in trades_to_close:
         closed_trade = state.close_trade(trade_id, exit_price, reason, current_time)
+
+        if reason == "SL_HIT":
+            state.last_sl_hit_time = current_time
+            state.reset_breakout_confirms()
         
         if reason == "SL_HIT" and len(state.closed_trades) == 1:
             # This is the first trade being stopped out - execute reversal
@@ -849,6 +890,7 @@ def run_trading_bot(test_mode=False, duration_minutes=30):
     print(f"Capital: ₹{TOTAL_CAPITAL} (First: ₹{FIRST_TRADE_CAPITAL}, Reversal: ₹{REVERSAL_CAPITAL}, Buffer: ₹{BUFFER_CAPITAL})")
     print(f"Position Sizing: Fixed Qty={FIXED_QUANTITY} | Target LTP≈₹{TARGET_LTP_FIRST_TRADE:.2f} for ₹{FIRST_TRADE_CAPITAL}")
     print(f"Risk Profile: SL={INITIAL_SL_PERCENT*100:.0f}% | TP={INITIAL_TP_PERCENT*100:.0f}% | Trail={TRAILING_SL_PERCENT*100:.0f}%")
+    print(f"2s Filters: ConfirmTicks={BREAKOUT_CONFIRM_TICKS} | MinExcess={MIN_BREAKOUT_EXCESS*100:.2f}% | CooldownAfterSL={COOLDOWN_AFTER_SL_SECONDS}s")
     print("="*70)
     
     # PHASE 1: Sync with market history
