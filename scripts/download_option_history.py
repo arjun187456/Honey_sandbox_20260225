@@ -65,6 +65,17 @@ def get_option_chain(index_key: str, expiry_date: str, headers: dict):
     return payload.get("data", [])
 
 
+def list_available_expiries(index_key: str, headers: dict, days_ahead: int = 60):
+    expiries = []
+    today = date.today()
+    for offset in range(0, days_ahead + 1):
+        candidate = (today + timedelta(days=offset)).isoformat()
+        chain = get_option_chain(index_key, candidate, headers)
+        if chain:
+            expiries.append((candidate, chain))
+    return expiries
+
+
 def resolve_expiry(index_key: str, preferred_expiry: str | None, headers: dict) -> tuple[str, list]:
     if not preferred_expiry:
         today = date.today()
@@ -179,6 +190,9 @@ def parse_args():
     parser.add_argument("--interval", default="day", choices=["1minute", "30minute", "day", "week", "month"])
     parser.add_argument("--index-key", default=DEFAULT_INDEX_KEY, help="Underlying index instrument key")
     parser.add_argument("--expiry", default=None, help="Expiry date YYYY-MM-DD (auto-detect if omitted)")
+    parser.add_argument("--all-expiries", action="store_true", help="Download for all available expiries in scan window")
+    parser.add_argument("--expiry-scan-days", type=int, default=60, help="Days ahead to scan for available expiries")
+    parser.add_argument("--max-expiries", type=int, default=0, help="Limit number of expiries when using --all-expiries (0 = no limit)")
     parser.add_argument("--strikes-around", type=int, default=2, help="Strikes around ATM (2 -> 5 strikes total)")
     parser.add_argument("--max-instruments", type=int, default=10, help="Max option instruments to download")
     parser.add_argument("--output-dir", default="data/options_history", help="Output directory for CSV files")
@@ -217,6 +231,105 @@ def main():
     expiry_used = args.expiry
 
     try:
+        if args.instrument_keys and args.all_expiries:
+            raise RuntimeError("--instrument-keys cannot be combined with --all-expiries")
+
+        output_root = Path(args.output_dir)
+        output_root.mkdir(parents=True, exist_ok=True)
+
+        if args.all_expiries:
+            if args.expiry:
+                raise RuntimeError("Use either --expiry or --all-expiries, not both")
+
+            spot = get_spot_price(args.index_key, headers)
+            if not spot:
+                raise RuntimeError("Could not fetch spot price")
+
+            available = list_available_expiries(args.index_key, headers, days_ahead=args.expiry_scan_days)
+            if not available:
+                raise RuntimeError("No expiries with option-chain data found in scan window")
+
+            if args.max_expiries > 0:
+                available = available[: args.max_expiries]
+
+            print(f"Index: {args.index_key}")
+            print(f"Spot: {spot:.2f}")
+            print(f"Expiries found: {len(available)}")
+
+            total_downloaded = 0
+            expiry_rows = []
+
+            for exp_idx, (expiry_value, chain) in enumerate(available, start=1):
+                expiry_folder = output_root / sanitize_filename(f"expiry_{expiry_value}")
+                expiry_folder.mkdir(parents=True, exist_ok=True)
+
+                expiry_selected = pick_near_atm_instruments(chain, spot, args.strikes_around)
+                expiry_selected = expiry_selected[: args.max_instruments]
+
+                print(f"\n=== Expiry {exp_idx}/{len(available)}: {expiry_value} | instruments={len(expiry_selected)} ===")
+
+                downloaded_for_expiry = 0
+                for idx, item in enumerate(expiry_selected, start=1):
+                    key = item["instrument_key"]
+                    option_type = item.get("option_type", "NA")
+                    strike = item.get("strike", 0)
+                    print(f"[{idx}/{len(expiry_selected)}] {key} ({option_type}, strike={strike})")
+
+                    candles = fetch_historical_candles(
+                        instrument_key=key,
+                        interval=args.interval,
+                        from_date=from_date,
+                        to_date=to_date,
+                        headers=headers,
+                    )
+
+                    filename = sanitize_filename(f"{key}_{args.interval}_{from_date}_{to_date}.csv")
+                    out_file = expiry_folder / filename
+                    write_candles_csv(out_file, candles)
+
+                    print(f"    ✅ candles={len(candles)} -> {out_file}")
+                    downloaded_for_expiry += 1
+                    total_downloaded += 1
+
+                expiry_rows.append([expiry_value, downloaded_for_expiry])
+
+            manifest = output_root / "manifest.csv"
+            with manifest.open("w", newline="", encoding="utf-8") as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerow([
+                    "generated_at",
+                    "index_key",
+                    "mode",
+                    "interval",
+                    "from_date",
+                    "to_date",
+                    "expiries_count",
+                    "file_count",
+                ])
+                writer.writerow([
+                    datetime.now().isoformat(timespec="seconds"),
+                    args.index_key,
+                    "ALL_EXPIRIES",
+                    args.interval,
+                    from_date,
+                    to_date,
+                    len(available),
+                    total_downloaded,
+                ])
+
+            expiry_manifest = output_root / "expiry_summary.csv"
+            with expiry_manifest.open("w", newline="", encoding="utf-8") as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerow(["expiry", "files_downloaded"])
+                writer.writerows(expiry_rows)
+
+            print("=" * 72)
+            print(f"✅ Completed. Files saved in: {output_root}")
+            print(f"✅ Manifest: {manifest}")
+            print(f"✅ Expiry summary: {expiry_manifest}")
+            print("=" * 72)
+            return 0
+
         if args.instrument_keys:
             keys = [k.strip() for k in args.instrument_keys.split(",") if k.strip()]
             selected = [{"option_type": "NA", "strike": 0, "instrument_key": k} for k in keys]
@@ -236,9 +349,6 @@ def main():
 
         selected = selected[: args.max_instruments]
         print(f"Instruments selected: {len(selected)}")
-
-        output_root = Path(args.output_dir)
-        output_root.mkdir(parents=True, exist_ok=True)
 
         downloaded = 0
         for idx, item in enumerate(selected, start=1):
