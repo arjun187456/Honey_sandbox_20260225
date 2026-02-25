@@ -20,11 +20,14 @@ Created: 2026-02-16
 import os
 import sys
 import time
+import atexit
+import fcntl
 import requests
 import pandas as pd
 from datetime import datetime, time as dt_time, timedelta
 from zoneinfo import ZoneInfo
 from urllib.parse import quote, quote_plus
+from pathlib import Path
 from dotenv import load_dotenv
 import json
 
@@ -195,6 +198,59 @@ class TradingState:
 
 
 state = TradingState()
+
+# ========== PROCESS LOCKING ==========
+_LOCK_FILE_HANDLE = None
+_LOCK_FILE_PATH = None
+
+
+def _sanitize_instance_id(instance_id: str) -> str:
+    """Return a filesystem-safe instance id."""
+    return "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in instance_id)
+
+
+def acquire_instance_lock(instance_id: str, lock_dir: str = "/tmp/honey_bot_locks"):
+    """Acquire a non-blocking per-instance lock to avoid duplicate bot runs."""
+    global _LOCK_FILE_HANDLE, _LOCK_FILE_PATH
+
+    safe_id = _sanitize_instance_id(instance_id)
+    Path(lock_dir).mkdir(parents=True, exist_ok=True)
+    _LOCK_FILE_PATH = os.path.join(lock_dir, f"{safe_id}.lock")
+
+    lock_fh = open(_LOCK_FILE_PATH, "w")
+    try:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print(f"\n⛔ Bot instance '{instance_id}' is already running.")
+        print(f"   Lock file: {_LOCK_FILE_PATH}")
+        print("   Use a different --instance-id to run another repo in parallel.")
+        sys.exit(1)
+
+    lock_fh.seek(0)
+    lock_fh.truncate()
+    lock_fh.write(str(os.getpid()))
+    lock_fh.flush()
+
+    _LOCK_FILE_HANDLE = lock_fh
+
+
+def release_instance_lock():
+    """Release process lock at exit."""
+    global _LOCK_FILE_HANDLE
+    if _LOCK_FILE_HANDLE is None:
+        return
+
+    try:
+        fcntl.flock(_LOCK_FILE_HANDLE.fileno(), fcntl.LOCK_UN)
+    except Exception:
+        pass
+
+    try:
+        _LOCK_FILE_HANDLE.close()
+    except Exception:
+        pass
+
+    _LOCK_FILE_HANDLE = None
 
 # ========== MOCK DATA FOR TESTING ==========
 class MockMarketData:
@@ -933,6 +989,16 @@ if __name__ == "__main__":
     parser.add_argument('--confirm-live', action='store_true', help='Confirm live trading (required with --live)')
     parser.add_argument('--force-entry', choices=['CALL', 'PUT'], help='Force a test entry of CALL or PUT')
     parser.add_argument('--close-open', action='store_true', help='Close existing open positions at start')
+    parser.add_argument(
+        '--instance-id',
+        default=os.path.basename(os.getcwd()),
+        help='Unique instance id for process lock (use different value per repo)'
+    )
+    parser.add_argument(
+        '--lock-dir',
+        default='/tmp/honey_bot_locks',
+        help='Directory to store process lock files'
+    )
     
     args = parser.parse_args()
     # Wire CLI flags into runtime globals
@@ -950,4 +1016,11 @@ if __name__ == "__main__":
     # Determine test_mode: if --live provided, override --test
     test_mode = False if args.live else args.test
 
-    run_trading_bot(test_mode=test_mode, duration_minutes=args.duration)
+    acquire_instance_lock(instance_id=args.instance_id, lock_dir=args.lock_dir)
+    atexit.register(release_instance_lock)
+    print(f"🔒 Instance lock acquired: {args.instance_id}")
+
+    try:
+        run_trading_bot(test_mode=test_mode, duration_minutes=args.duration)
+    finally:
+        release_instance_lock()
